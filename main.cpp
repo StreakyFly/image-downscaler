@@ -8,31 +8,39 @@
 #include <thread>
 #include <mutex>
 #include <opencv2/opencv.hpp>
+#include <format>
+#include <fstream>
 
-using namespace std;
+
 using namespace cv;
+using std::string;
 namespace fs = std::filesystem;
 
 
 void core();
-void coutPlus(const string& text, const string& color="DEFAULT", boolean endLine=true);
+void coutPlus(const string& text, const string& color="DEFAULT", bool endLine=true);
 void cerrPlus(const string& text);
 string getColorEscapeSequence(const string& color);
 void setConsoleTextColor(int colorCode);
 string selectFolder();
 void createBackup(const string& dir);
-optional<Mat> resizeImage(const string& imagePath, const Mat& image, int maxImageLength);
+std::tuple<std::optional<Mat>, int, int, int, int> resizeImage(const string& imagePath, const Mat& image, int maxImageLength);
 void processDirectory(const string& directoryPath, int maxImageLength);
 void processTask(const string& imagePath, int maxImageLength, int taskId);
-void runTasks(const vector<string>& imagePaths, int maxImageLength);
-optional<Mat> readImage(const string& imagePath);
-void saveImage(const string& outputFileName, const Mat& image, const vector<int>& compressionParams={});
-vector<int> getCompressionParamsForImage(const string& imageType, int imageQuality=100);
+void runTasks(const std::vector<string>& imagePaths, int maxImageLength);
+std::optional<Mat> readImage(const string& imagePath);
+void saveImage(const string& outputFileName, const Mat& image, const std::vector<int>& compressionParams={});
+std::vector<int> getCompressionParamsForImage(const string& imageType, int imageQuality=100);
+string getRelativePath(const string& initialPath, const string& filePath);
+int getFileSize(const string& filePath);
+double getFileSizeInKB(const string& filePath);
+void coutPlusPlus(const std::vector<std::string>& texts, const std::vector<std::string>& colors, bool endLine=true);
 
 
-mutex mtx;
-condition_variable cvThreads;
+std::mutex mtx;
+std::condition_variable cvThreads;
 int activeThreads = 0;
+
 
 
 int main() {
@@ -45,17 +53,17 @@ void core() {
     const string DIRECTORY = selectFolder();
     int maxImageLength;
     coutPlus("Enter the maximum length of the image's dimensions [px]:\n>> ", "blue", false);
-    cin >> maxImageLength;
+    std::cin >> maxImageLength;
 
     createBackup(DIRECTORY);
 
-    unsigned int numThreads = thread::hardware_concurrency();
-    coutPlus("Number of threads supported: " + to_string(numThreads), "yellow");
+    unsigned int numThreads = std::thread::hardware_concurrency();
+    coutPlus("Number of threads supported: " + std::to_string(numThreads), "yellow");
 
     processDirectory(DIRECTORY, maxImageLength);
 
     // Wait until all tasks are completed
-    unique_lock<mutex> lock(mtx);
+    std::unique_lock<std::mutex> lock(mtx);
     cvThreads.wait(lock, [] { return activeThreads == 0; });
 
 
@@ -67,31 +75,59 @@ void core() {
 
 
 void processTask(const string& imagePath, int maxImageLength, int taskId) {
+    double oldImageSize = getFileSizeInKB(imagePath);
+    oldImageSize = std::round(oldImageSize * 100) / 100;  // Round to two decimal places
 //    {
-//        unique_lock<mutex> lock(mtx);
-//        cout << "Processing Task " << taskId << " on Thread " << this_thread::get_id() << endl;
+//        std::unique_lock<std::mutex> lock(mtx);
+//        std::cout << "Processing Task " << taskId << " on Thread " << std::this_thread::get_id() << std::endl;
 //    }
+//    std::this_thread::sleep_for(std::chrono::seconds(1));  // useless delay?
 
-//    this_thread::sleep_for(chrono::seconds(1));  // useless delay?
-
-    optional<Mat> read_result = readImage(imagePath);
-    if (!read_result.has_value()) {
+    std::optional<Mat> readResult = readImage(imagePath);
+    if (!readResult.has_value()) {
         return;
     }
-    Mat img = read_result.value();
+    Mat img = readResult.value();
 
-    optional<Mat> resized_result = resizeImage(imagePath, img, maxImageLength);
-    if (resized_result.has_value()) {
-        img = resized_result.value();
+    auto resizeResult = resizeImage(imagePath, img, maxImageLength);
+    if (get<0>(resizeResult).has_value()) {
+        img = get<0>(resizeResult).value();
     }
 
     // TODO user should be able to choose at start whether to convert all images to .jpg or keep them as same types
-    vector<int> compressionParams = getCompressionParamsForImage("jpg", 50);
+    std::vector<int> compressionParams = getCompressionParamsForImage("jpg", 50);
 
     saveImage(imagePath, img, compressionParams);
 
+
+    int oldWidth = get<1>(resizeResult);
+    int oldHeight = get<2>(resizeResult);
+    int newWidth = get<3>(resizeResult);
+    int newHeight = get<4>(resizeResult);
+
+    double newImageSize = getFileSizeInKB(imagePath);
+    newImageSize = std::round(newImageSize * 100) / 100;  // Round to two decimal places
+
+    string msg = std::format("{}", imagePath);
+    std::vector<string> texts;
+    std::vector<std::string> colors;
+    string fileSizeDiff = std::format("{}kB => {}kB", oldImageSize, newImageSize);
+    string oldDimensions = std::format("[{}x{}]", oldWidth, oldHeight);
+    string newDimensions = std::format("[{}x{}]", newWidth, newHeight);
+
+    if (newWidth == -1) {
+        string notDownscaled = std::format("{} (not downscaled)", oldDimensions);
+        texts = {msg, ": ", notDownscaled, "; ", fileSizeDiff};
+        colors = {"light-blue", "light-blue", "blue2", "light-blue", "yellow2"};
+    } else {
+        string downscaled = std::format("{} => {}", oldDimensions, newDimensions);
+        texts = {msg, ": ", downscaled, "; ", fileSizeDiff};
+        colors = {"green", "green", "blue2", "green", "yellow2"};
+    }
+    coutPlusPlus(texts, colors);
+
     {
-        lock_guard<mutex> lock(mtx);
+        std::lock_guard<std::mutex> lock(mtx);
         activeThreads--;
     }
 
@@ -99,23 +135,45 @@ void processTask(const string& imagePath, int maxImageLength, int taskId) {
 }
 
 
-void runTasks(const vector<string>& imagePaths, int maxImageLength) {
+int getFileSize(const string& filePath) {
+    std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+    if (!file)
+        return -1; // Error opening the file
+
+    std::streampos fileSize = file.tellg();
+    file.close();
+    return fileSize;
+}
+
+
+double getFileSizeInKB(const string& filePath) {
+    std::streampos fileSize = getFileSize(filePath);
+    if (fileSize == -1) {
+        cerrPlus("Failed to get image file size.");
+    }
+    double sizeKB = fileSize / 1024.0;
+
+    return sizeKB;
+}
+
+
+void runTasks(const std::vector<string>& imagePaths, int maxImageLength) {
     unsigned int numTasks = imagePaths.size();
     for (int i = 0; i < numTasks; ++i) {
         // Wait until a thread is available
-        unique_lock<mutex> lock(mtx);
-        cvThreads.wait(lock, [] { return activeThreads < thread::hardware_concurrency(); });
+        std::unique_lock<std::mutex> lock(mtx);
+        cvThreads.wait(lock, [] { return activeThreads < std::thread::hardware_concurrency(); });
 
         activeThreads++;
 
-        thread t(processTask, imagePaths[i], maxImageLength, i);
+        std::thread t(processTask, imagePaths[i], maxImageLength, i);
         t.detach();
     }
 }
 
 
 void processDirectory(const string& directoryPath, int maxImageLength) {
-    vector<string> imagePaths;
+    std::vector<string> imagePaths;
     for (const auto& entry : fs::directory_iterator(directoryPath)) {
         if (fs::is_directory(entry)) {
             // Process subdirectory recursively
@@ -133,18 +191,28 @@ void processDirectory(const string& directoryPath, int maxImageLength) {
 }
 
 
-optional<Mat> readImage(const string& imagePath) {
+string getRelativePath(const string& initialPath, const string& filePath) {
+    fs::path initialDir(initialPath);
+    fs::path file(filePath);
+
+    fs::path relativePath = file.lexically_relative(initialDir);
+
+    return relativePath.string();
+}
+
+
+std::optional<Mat> readImage(const string& imagePath) {
     Mat image = imread(imagePath);
 
     if (image.empty()) {
         cerrPlus("Failed to load the image: " + imagePath);
-        return nullopt;
+        return std::nullopt;
     }
     return image;
 }
 
 
-void saveImage(const string& outputFileName, const Mat& image, const vector<int>& compressionParams) {
+void saveImage(const string& outputFileName, const Mat& image, const std::vector<int>& compressionParams) {
     if (compressionParams.empty()) {
         imwrite(outputFileName, image);
         return;
@@ -155,8 +223,8 @@ void saveImage(const string& outputFileName, const Mat& image, const vector<int>
 }
 
 
-vector<int> getCompressionParamsForImage(const string& imageType, int imageQuality) {
-    vector<int> compressionParams;
+std::vector<int> getCompressionParamsForImage(const string& imageType, int imageQuality) {
+    std::vector<int> compressionParams;
     if (imageType == "jpg") {
         compressionParams.push_back(IMWRITE_JPEG_QUALITY);
         compressionParams.push_back(imageQuality); // Set the desired compression level (0-100)
@@ -170,12 +238,12 @@ vector<int> getCompressionParamsForImage(const string& imageType, int imageQuali
 }
 
 
-optional<Mat> resizeImage(const string& imagePath, const Mat& image, int maxImageLength) {
+std::tuple<std::optional<Mat>, int, int, int, int> resizeImage(const string& imagePath, const Mat& image, int maxImageLength) {
     int width = image.cols;
     int height = image.rows;
 
     if (width <= maxImageLength && height <= maxImageLength) {
-        return nullopt;
+        return make_tuple(std::nullopt, width, height, -1, -1);
     }
 
     int newWidth, newHeight;
@@ -190,9 +258,7 @@ optional<Mat> resizeImage(const string& imagePath, const Mat& image, int maxImag
     Mat resizedImage;
     resize(image, resizedImage, Size(newWidth, newHeight));
 
-    coutPlus("Image " + imagePath + " resized to " + to_string(newWidth) + "x" + to_string(newHeight),"green");
-
-    return resizedImage;
+    return std::make_tuple(resizedImage, width, height, newWidth, newHeight);
 }
 
 
@@ -231,13 +297,30 @@ string selectFolder() {
 }
 
 
-void coutPlus(const string& text, const string& color, boolean endLine) {
+void coutPlusPlus(const std::vector<std::string>& texts, const std::vector<std::string>& colors, bool endLine) {
     {
-        lock_guard<mutex> lock(mtx);
-        setConsoleTextColor(stoi(getColorEscapeSequence(color)));
-        cout << text;
+        std::lock_guard<std::mutex> lock(mtx);
+
+        for (size_t i = 0; i < texts.size(); ++i) {
+            setConsoleTextColor(stoi(getColorEscapeSequence(colors[i])));
+            std::cout << texts[i];
+            setConsoleTextColor(stoi(getColorEscapeSequence("DEFAULT")));
+        }
         if (endLine) {
-            cout << endl;
+            std::cout << std::endl;
+        }
+    }
+}
+
+
+void coutPlus(const string& text, const string& color, bool endLine) {
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        setConsoleTextColor(stoi(getColorEscapeSequence(color)));
+        std::cout << text;
+        if (endLine) {
+            std::cout << std::endl;
         }
         setConsoleTextColor(stoi(getColorEscapeSequence("DEFAULT")));
     }
@@ -246,9 +329,10 @@ void coutPlus(const string& text, const string& color, boolean endLine) {
 
 void cerrPlus(const string& text) {
     {
-        lock_guard<mutex> lock(mtx);
+        std::lock_guard<std::mutex> lock(mtx);
+
         setConsoleTextColor(stoi(getColorEscapeSequence("red")));
-        cerr << text << endl;
+        std::cerr << text << std::endl;
         setConsoleTextColor(stoi(getColorEscapeSequence("DEFAULT")));
     }
 }
@@ -261,26 +345,29 @@ void setConsoleTextColor(int colorCode) {
 
 
 string getColorEscapeSequence(const string& color) {
-    static unordered_map<string, int> colorMap = {
+    static std::unordered_map<string, int> colorMap = {
             {"DEFAULT", FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE},
             {"red", FOREGROUND_RED | FOREGROUND_INTENSITY},
             {"green", FOREGROUND_GREEN | FOREGROUND_INTENSITY},
             {"blue", FOREGROUND_BLUE | FOREGROUND_INTENSITY},
+            {"blue2", FOREGROUND_BLUE | FOREGROUND_INTENSITY | BACKGROUND_INTENSITY},
             {"yellow", FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY},
-            {"pink", FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY}
+            {"yellow2", FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY | BACKGROUND_INTENSITY},
+            {"pink", FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY},
+            {"light-blue", FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY}
     };
 
     auto it = colorMap.find(color);
     if (it != colorMap.end()) {
         int colorCode = it->second;
-        return to_string(colorCode);
+        return std::to_string(colorCode);
     }
 
     // Return default color if color is not found
     auto defaultColor = colorMap.find("DEFAULT");
     if (defaultColor != colorMap.end()) {
         int defaultColorCode = defaultColor->second;
-        return to_string(defaultColorCode);
+        return std::to_string(defaultColorCode);
     }
 
     return "";
